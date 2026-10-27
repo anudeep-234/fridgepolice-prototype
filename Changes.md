@@ -42,3 +42,10 @@ Test result: with Pizza at 75% and a 25% hold, entering 40% physically left set 
 ## How the system stays correct
 
 Each rule runs in one place in `inventory.js`, and every route calls those functions. Expiry runs before every read and write, so stale holds never block a request. Ids prevent identical names from mixing. The history log records each state change, so every value can be traced.
+
+## Update: correction and spoiled items
+
+- `remaining` always means the amount free to request: the physical amount entered by the owner minus pending holds.
+- Corrections subtract pending holds, so a held portion is never counted twice. Example: with a 25% hold, entering 40% physically left sets remaining to 15%.
+- Spoiled items cannot be corrected. The API returns "Item is spoiled" and the item stays closed.
+- Correction input is validated: non-numeric or negative amounts are rejected.

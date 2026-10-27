@@ -82,12 +82,22 @@ export function spoilItem(itemId) {
 }
 
 // Scenario 4: owner sets the real count; the change is logged.
+// Scenario 4: the owner enters the physical amount left. Pending holds are
+// still promised to someone, so they are subtracted, and the result is the
+// amount free to request. Spoiled items cannot be corrected.
 export function correctCount(itemId, actualPercent) {
+  expireHolds();
   const item = state.items.find((i) => i.id === itemId);
   if (!item) throw new Error("Item not found");
+  if (item.spoiled) throw new Error("Item is spoiled");
+  const physical = Number(actualPercent);
+  if (!Number.isFinite(physical) || physical < 0) throw new Error("Enter a valid amount");
+  const reserved = state.holds
+    .filter((h) => h.itemId === itemId && h.status === "pending")
+    .reduce((sum, h) => sum + h.percent, 0);
   const before = item.remaining;
-  item.remaining = Math.max(0, Math.min(100, actualPercent));
-  log({ type: "correction", itemId, from: before, to: item.remaining });
+  item.remaining = Math.max(0, Math.min(100, physical) - reserved);
+  log({ type: "correction", itemId, from: before, to: item.remaining, physical });
   return item;
 }
 
