@@ -72,7 +72,15 @@ export default function App() {
           return (
             <div key={item.id} style={{ border: "1px solid #ccc", padding: 12, marginBottom: 12, opacity: item.spoiled ? 0.5 : 1 }}>
               <strong>{item.name}</strong> (id ...{item.id.slice(-6)}) owner: {item.owner}
-              <div>Remaining: <b>{item.remaining}%</b> {item.spoiled && "— SPOILED"}</div>
+              <div>
+                Physical: <b>{item.physical}%</b> · Held: <b>{item.reserved}%</b> · Free to request: <b>{item.remaining}%</b>
+                {item.spoiled && " — SPOILED"}
+              </div>
+              {item.shortfall > 0 && (
+                <div style={{ color: "crimson" }}>
+                  Shortfall: {item.shortfall}% is promised to holds but not physically there. It clears when those holds expire or are consumed.
+                </div>
+              )}
 
               <div style={{ marginTop: 8 }}>
                 <input placeholder="Requester" value={f.requester || ""}
@@ -100,6 +108,14 @@ export default function App() {
                 {itemHolds.map((h) => (
                   <li key={h.id}>
                     {h.requester} — {h.percent}% — {h.status}
+                    {h.status === "requested" && (
+                      <>
+                        {" "}(awaiting owner approval){" "}
+                        <button onClick={() => act(() => api("POST", `/holds/${h.id}/approve`, {}))}>
+                          Approve
+                        </button>
+                      </>
+                    )}
                     {h.status === "pending" && (
                       <>
                         {" "}(expires {new Date(h.expiresAt).toLocaleTimeString()}){" "}

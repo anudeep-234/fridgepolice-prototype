@@ -1,11 +1,14 @@
 ﻿// All FridgePolice business rules live here.
 // Source of truth: item.physical, the percent physically in the fridge.
-// item.remaining is derived: physical minus pending holds, or 0 if spoiled.
-// Holds never change physical stock, so expiry can only free up what is
-// actually there and cannot overstate inventory.
-const HOLD_TTL_MS = Number(process.env.HOLD_TTL_MS) || 30 * 60 * 1000; // default 30 min
+// item.remaining is derived: physical minus active holds, or 0 if spoiled.
+// Hold lifecycle: requested -> pending (after owner approval) -> consumed,
+// or requested/pending -> expired, or any open hold -> cancelled on spoilage.
+const HOLD_TTL_MS = Number(process.env.HOLD_TTL_MS) || 30 * 60 * 1000;
 
 let state = { items: [], holds: [], history: [] };
+
+// Holds that still count against stock.
+const ACTIVE = ["requested", "pending"];
 
 function log(entry) {
   state.history.unshift({ at: new Date().toISOString(), ...entry });
@@ -13,15 +16,15 @@ function log(entry) {
 
 function reservedFor(itemId) {
   return state.holds
-    .filter((h) => h.itemId === itemId && h.status === "pending")
+    .filter((h) => h.itemId === itemId && ACTIVE.includes(h.status))
     .reduce((sum, h) => sum + h.percent, 0);
 }
 
-// Recompute every derived value from physical stock and pending holds.
+// Recompute every derived value from physical stock and active holds.
 function recalc(item) {
   item.reserved = reservedFor(item.id);
   item.remaining = item.spoiled ? 0 : Math.max(0, item.physical - item.reserved);
-  item.shortfall = Math.max(0, item.reserved - item.physical); // holds physical stock can't cover
+  item.shortfall = Math.max(0, item.reserved - item.physical);
   return item;
 }
 
@@ -43,11 +46,10 @@ export function createItem(name, owner) {
   return item;
 }
 
-// Scenario 2: holds past their time stop counting against the item.
-// Physical stock is not touched, so nothing is added back.
+// Scenario 2: holds past their time stop counting. Nothing is added back.
 export function expireHolds(now = Date.now()) {
   for (const hold of state.holds) {
-    if (hold.status === "pending" && hold.expiresAt <= now) {
+    if (ACTIVE.includes(hold.status) && hold.expiresAt <= now) {
       hold.status = "expired";
       log({ type: "hold_expired", holdId: hold.id, itemId: hold.itemId, percent: hold.percent });
     }
@@ -56,7 +58,7 @@ export function expireHolds(now = Date.now()) {
 }
 
 // Scenario 1: check and reserve in one synchronous step, so two requests
-// can't both claim the last portion.
+// can't both claim the last portion. The hold waits for owner approval.
 export function requestPortion(itemId, requester, percent) {
   expireHolds();
   const item = state.items.find((i) => i.id === itemId);
@@ -69,8 +71,8 @@ export function requestPortion(itemId, requester, percent) {
     itemId,
     requester,
     percent,
-    status: "pending",
-    expiresAt: Date.now() + HOLD_TTL_MS,
+    status: "requested",
+    expiresAt: Date.now() + HOLD_TTL_MS, // must be approved within the TTL
   };
   state.holds.push(hold);
   recalc(item);
@@ -78,7 +80,18 @@ export function requestPortion(itemId, requester, percent) {
   return hold;
 }
 
-// Eating a held portion removes it from physical stock.
+// Owner approval starts the window in which the portion must be eaten.
+export function approveHold(holdId) {
+  expireHolds();
+  const hold = state.holds.find((h) => h.id === holdId);
+  if (!hold || hold.status !== "requested") throw new Error("Hold cannot be approved");
+  hold.status = "pending";
+  hold.expiresAt = Date.now() + HOLD_TTL_MS;
+  log({ type: "approved", holdId, itemId: hold.itemId, requester: hold.requester, percent: hold.percent });
+  return hold;
+}
+
+// Eating an approved portion removes it from physical stock.
 export function markConsumed(holdId) {
   expireHolds();
   const hold = state.holds.find((h) => h.id === holdId);
@@ -96,7 +109,7 @@ export function spoilItem(itemId) {
   const item = state.items.find((i) => i.id === itemId);
   if (!item) throw new Error("Item not found");
   for (const hold of state.holds) {
-    if (hold.itemId === itemId && hold.status === "pending") hold.status = "cancelled";
+    if (hold.itemId === itemId && ACTIVE.includes(hold.status)) hold.status = "cancelled";
   }
   item.spoiled = true;
   item.physical = 0;
@@ -105,10 +118,9 @@ export function spoilItem(itemId) {
   return item;
 }
 
-// Scenario 4: the owner enters what is physically left. Pending holds are still
-// promised, so they are subtracted to get the free amount. If physical stock is
-// below the holds, shortfall shows how much is over-promised until those holds
-// are consumed or expire.
+// Scenario 4: the owner enters what is physically left. Active holds are
+// subtracted to get the free amount. If holds exceed physical stock, shortfall
+// shows the uncovered amount until those holds expire or are consumed.
 export function correctCount(itemId, actualPercent) {
   expireHolds();
   const item = state.items.find((i) => i.id === itemId);

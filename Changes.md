@@ -57,3 +57,10 @@ Each rule runs in one place in `inventory.js`, and every route calls those funct
 - Consuming a held portion reduces physical stock.
 - If a correction is lower than the pending holds, `remaining` stays at 0 and `shortfall` shows the over-promised amount. When those holds expire or are consumed, the shortfall clears.
 - Edge-case test with a 10-second hold timer (`HOLD_TTL_MS`): Pizza at 100%, holds of 25% and 30%, correction to 10%. Result: remaining 0, shortfall 45. After the holds expire: physical 10, remaining 10, shortfall 0. A version that clamped to 0 and added holds back on expiry would have shown 55%.
+
+## Update: owner approval and diagnostics
+
+- Requests start as `requested` and reserve stock immediately, so no one else can claim the same portion while it waits.
+- The owner approves a request, which moves it to `pending` and starts the timer.
+- A request that isn't approved within the TTL expires and releases its portion.
+- The item card shows physical stock, held amount, free amount, and any shortfall.
