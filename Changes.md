@@ -49,3 +49,11 @@ Each rule runs in one place in `inventory.js`, and every route calls those funct
 - Corrections subtract pending holds, so a held portion is never counted twice. Example: with a 25% hold, entering 40% physically left sets remaining to 15%.
 - Spoiled items cannot be corrected. The API returns "Item is spoiled" and the item stays closed.
 - Correction input is validated: non-numeric or negative amounts are rejected.
+
+## Update: derived stock, shortfall, and expiry
+
+- Physical stock is the source of truth. `remaining` is calculated as physical minus pending holds (0 if spoiled), and every value is recalculated after each change.
+- Expiry never adds stock back. An expired hold simply stops counting, so availability can't exceed physical stock.
+- Consuming a held portion reduces physical stock.
+- If a correction is lower than the pending holds, `remaining` stays at 0 and `shortfall` shows the over-promised amount. When those holds expire or are consumed, the shortfall clears.
+- Edge-case test with a 10-second hold timer (`HOLD_TTL_MS`): Pizza at 100%, holds of 25% and 30%, correction to 10%. Result: remaining 0, shortfall 45. After the holds expire: physical 10, remaining 10, shortfall 0. A version that clamped to 0 and added holds back on expiry would have shown 55%.
