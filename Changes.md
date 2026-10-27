@@ -2,65 +2,70 @@
 
 ## What the app does
 
-FridgePolice is a roommate food tracker. Roommates add shared items, request portions, and the app keeps the remaining amount accurate. The prototype uses an Express server with in-memory state and a React client that polls it every two seconds.
+FridgePolice tracks shared food in a roommate fridge as percentages. Roommates request a portion, the owner approves it, and the portion is marked consumed when eaten. The prototype has an Express server that holds all state in memory and a React client that polls the server every two seconds.
 
-Each item is tracked as a percentage of the whole. Requests reserve a portion immediately as a "hold". A hold becomes "consumed" when the roommate confirms they used it, "expired" if it's not confirmed in time, or "cancelled" if the item is spoiled.
+## Core model
+
+Physical stock is the only stored quantity. Everything else is calculated from it.
+
+- `physical`: the percent physically in the fridge. This is the source of truth. It changes only when a portion is consumed, when the owner corrects the count, or when the item is spoiled.
+- `reserved`: the sum of all holds in `requested` or `pending` status.
+- `remaining` (free to request): 0 if the item is spoiled, otherwise `max(0, physical - reserved)`.
+- `shortfall`: `max(0, reserved - physical)`. This is the amount promised to holds that the fridge doesn't physically have.
+
+Every change recalculates these values, so they can't drift apart.
+
+## Hold lifecycle
+
+- `requested`: a roommate asked for a portion. It reserves stock immediately, so no one else can claim it.
+- `pending`: the owner approved it. The hold now has a fresh 30-minute window to be eaten.
+- `consumed`: the portion was eaten. `physical` drops by the held amount.
+- `expired`: the time window passed before approval or consumption. The hold stops counting against stock.
+- `cancelled`: the item was spoiled while the hold was open.
+
+Only `pending` holds can be consumed. `expired` and `cancelled` are final. Expiry never adds stock back, because stock was never removed when the hold was created.
+
+The timer length is `HOLD_TTL_MS`, which defaults to 30 minutes. It can be overridden with an environment variable for testing.
 
 ## Scenario 1: Double allocation of the last portion
 
-Requests check and reserve in a single synchronous function (`requestPortion` in `server/inventory.js`). The remaining amount is reduced at the moment of the request, so a second request for the same portion sees the reduced value and is rejected with "Only X% left."
-
-Test result: with Pizza at 75% remaining after one request, a second request for 25% succeeded and left 0%. A third request was rejected with "Only 0% left."
+`requestPortion` checks `remaining` and creates the hold in one synchronous step. A second request for the same portion sees the reduced amount and is rejected with "Only X% left." Because requests reserve stock before approval, two roommates can't both be promised the same last portion.
 
 ## Scenario 2: Approved but unclaimed food
 
-Every hold has an `expiresAt` timestamp. Before each read or write, `expireHolds` releases any pending hold whose time has passed and returns its percentage to the item. Marking an item spoiled cancels all its pending holds and sets remaining to 0.
-
-Test result: with a 10-second TTL, a 30% hold was not confirmed. After it expired, remaining returned to 100%, the history logged `hold_expired`, and a later consume request was rejected with "Hold not active." Spoiling an item with a pending 20% hold changed that hold to `cancelled` and disabled further requests.
-
-Production setting: `HOLD_TTL_MS` is 30 minutes.
+A request that isn't approved in time expires and stops counting. An approved hold that isn't eaten in time also expires. Consuming an expired hold is rejected with "Hold not active." Spoiling an item cancels all of its open holds and sets `physical` and `remaining` to 0.
 
 ## Scenario 3: Identical items
 
-Every item gets a UUID with `crypto.randomUUID()`. The name is a label only. Matching is always done by id, so two items named "Ketchup" are stored and updated separately.
-
-Test result: a 50% request on the first Ketchup left the second at 100%. Spoiling the second did not affect the first.
+Each item gets a UUID from `crypto.randomUUID()`. The name is a label only. All lookups use the id, so two items named "Ketchup" are stored, updated, and spoiled separately. The UI shows the last six characters of each id.
 
 ## Scenario 4: Inventory correction
 
-`correctCount` sets remaining to the physical amount minus the portions still on hold, so a correction never counts a held portion twice. Every correction is written to history with the before and after values. Corrections on spoiled items are rejected.
+The owner enters the amount physically left. `correctCount` sets `physical` to that value and recalculates. Active holds are subtracted to produce `remaining`, so a held portion is never counted twice. Corrections are rejected on spoiled items, and values outside 0 to 100 are rejected. Every correction is logged with the before and after values.
 
-Test result: with Pizza at 75% and a 25% hold, entering 40% physically left set remaining to 15%, which is 40% minus the 25% hold. The history logged `correction (75% → 15%)`.
+## Edge case: correction below holds, then expiry
 
-## Assumptions and decisions
+Expected sequence with a 10-second timer:
 
-- Requests are auto-approved. The brief describes an owner approving a portion, so this is a simplification.
-- State is in memory. Restarting the server clears all data.
-- Quantities are percentages, not units or weights.
-- Corrections clamp at 0 if the physical amount is smaller than the held portions.
+1. Pizza starts at physical 100%.
+2. Two requests reserve 25% and 30%. Reserved is 55%, remaining is 45%.
+3. The owner corrects physical to 10%. Reserved stays 55%, so remaining is 0% and shortfall is 45%. Nothing is clamped or lost.
+4. Both holds expire. Reserved drops to 0%.
+5. Final state: physical 10%, remaining 10%, shortfall 0%.
 
-## How the system stays correct
+If expiry added stock back, step 5 would show 55%, which would overstate the fridge.
 
-Each rule runs in one place in `inventory.js`, and every route calls those functions. Expiry runs before every read and write, so stale holds never block a request. Ids prevent identical names from mixing. The history log records each state change, so every value can be traced.
+## Assumptions and simplifications
 
-## Update: correction and spoiled items
+- Owner approval is a single action. The app doesn't record which person approved.
+- There is no authentication or user accounts.
+- State is in memory, so restarting the server clears all data.
+- Quantities are percentages of the whole, not units or weights.
+- Holds that exceed physical stock are allowed to exist temporarily, and the shortfall shows them. The owner resolves them by consuming, approving, or waiting for expiry.
 
-- `remaining` always means the amount free to request: the physical amount entered by the owner minus pending holds.
-- Corrections subtract pending holds, so a held portion is never counted twice. Example: with a 25% hold, entering 40% physically left sets remaining to 15%.
-- Spoiled items cannot be corrected. The API returns "Item is spoiled" and the item stays closed.
-- Correction input is validated: non-numeric or negative amounts are rejected.
+## How to test
 
-## Update: derived stock, shortfall, and expiry
-
-- Physical stock is the source of truth. `remaining` is calculated as physical minus pending holds (0 if spoiled), and every value is recalculated after each change.
-- Expiry never adds stock back. An expired hold simply stops counting, so availability can't exceed physical stock.
-- Consuming a held portion reduces physical stock.
-- If a correction is lower than the pending holds, `remaining` stays at 0 and `shortfall` shows the over-promised amount. When those holds expire or are consumed, the shortfall clears.
-- Edge-case test with a 10-second hold timer (`HOLD_TTL_MS`): Pizza at 100%, holds of 25% and 30%, correction to 10%. Result: remaining 0, shortfall 45. After the holds expire: physical 10, remaining 10, shortfall 0. A version that clamped to 0 and added holds back on expiry would have shown 55%.
-
-## Update: owner approval and diagnostics
-
-- Requests start as `requested` and reserve stock immediately, so no one else can claim the same portion while it waits.
-- The owner approves a request, which moves it to `pending` and starts the timer.
-- A request that isn't approved within the TTL expires and releases its portion.
-- The item card shows physical stock, held amount, free amount, and any shortfall.
+- Scenario 1: request 75% for one roommate, then 25% twice for another. The second 25% request is rejected.
+- Scenario 2: set `HOLD_TTL_MS` to 10000, request a portion, and wait. It expires and the consume button or call is rejected.
+- Scenario 3: add two items named "Ketchup", request on one, and confirm the other is unchanged.
+- Scenario 4: run the edge-case sequence above.
